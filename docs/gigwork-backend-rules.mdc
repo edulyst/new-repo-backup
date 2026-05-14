@@ -1,0 +1,252 @@
+---
+description: GigWork Backend — TypeScript & API Development Rules
+globs: ["src/**/*.ts"]
+alwaysApply: true
+---
+
+# GigWork Backend — Cursor Rules
+
+## TypeScript Philosophy — Keep It Simple
+
+- Use plain object types, not complex generics
+- No `<T>`, `<Record<K,V>>`, multiple union chains, or mapped types
+- If a type needs more than 2 lines to define, split it into named types
+- Use `type` not `interface` for data shapes
+- Prefer explicit over inferred — name your return types on functions
+
+### Allowed
+
+```ts
+type UserId = string
+type UserRole = 'worker' | 'employer' | 'admin'
+type UserStatus = 'pending' | 'active' | 'suspended' | 'banned'
+
+type User = {
+  id: UserId
+  phone: string | null
+  email: string | null
+  role: UserRole
+  status: UserStatus
+  created_at: string
+}
+```
+
+### Not Allowed
+
+```ts
+// Too complex — ban this style
+type ApiResponse<T extends Record<string, unknown>> = {
+  data: T extends Array<infer U> ? U[] : T
+}
+```
+
+---
+
+## File & Folder Structure
+
+```
+src/
+  routes/         # Express/Fastify route files — one file per resource
+  controllers/    # One function per endpoint, no business logic here
+  services/       # All business logic lives here
+  repositories/   # All DB queries live here — no raw SQL in services
+  middlewares/    # auth, role check, validation, error handler
+  validators/     # Zod schemas for every request body
+  types/          # All shared type definitions — one file per domain
+  utils/          # Pure helper functions only
+  config/         # Env vars, DB config, constants
+```
+
+---
+
+## API Response — Always Use This Shape
+
+```ts
+// types/api.ts
+type ApiSuccess = {
+  status: 'success'
+  message: string
+  data: object
+}
+
+type ApiError = {
+  status: 'error'
+  message: string
+  errors: { field: string; message: string }[]
+}
+
+type ApiPaginated = {
+  status: 'success'
+  message: string
+  data: object
+  meta: {
+    page: number
+    limit: number
+    total: number
+    total_pages: number
+  }
+}
+```
+
+Every controller must call one of:
+
+```ts
+res.status(200).json(success(data, 'Profile created'))
+res.status(400).json(error('Validation failed', fieldErrors))
+res.status(200).json(paginated(items, total, page, limit))
+```
+
+---
+
+## Controllers — One Job Only
+
+```ts
+// controllers/worker.controller.ts
+// Controller only: validate input → call service → send response
+// No DB calls, no business logic, no if/else chains
+
+export async function createProfile(req: Request, res: Response) {
+  const body = createProfileSchema.parse(req.body)  // throws if invalid
+  const profile = await workerService.createProfile(req.user.id, body)
+  return res.status(201).json(success(profile, 'Profile created'))
+}
+```
+
+---
+
+## Services — Business Logic Only
+
+```ts
+// services/worker.service.ts
+// Service only: orchestrate, validate business rules, call repositories
+// No req/res objects, no HTTP status codes
+
+export async function createProfile(userId: string, data: CreateProfileData) {
+  const existing = await workerRepo.findByUserId(userId)
+  if (existing) throw new AppError('PROFILE_ALREADY_EXISTS', 409)
+
+  const age = calculateAge(data.dob)
+  if (age < 18) throw new AppError('PROFILE_UNDERAGE', 400)
+
+  return workerRepo.create(userId, data)
+}
+```
+
+---
+
+## Repositories — DB Queries Only
+
+```ts
+// repositories/worker.repo.ts
+// Repo only: raw DB calls. No business rules, no validation.
+
+export async function create(userId: string, data: CreateProfileData) {
+  const result = await db('worker_profiles').insert({ user_id: userId, ...data }).returning('*')
+  return result[0]
+}
+
+export async function findByUserId(userId: string) {
+  return db('worker_profiles').where({ user_id: userId }).first()
+}
+```
+
+---
+
+## Error Handling — Centralised
+
+```ts
+// utils/errors.ts
+export class AppError extends Error {
+  constructor(
+    public code: string,
+    public httpStatus: number,
+    message?: string
+  ) {
+    super(message ?? code)
+  }
+}
+
+// middlewares/error.middleware.ts
+export function errorHandler(err, req, res, next) {
+  if (err instanceof AppError) {
+    return res.status(err.httpStatus).json({
+      status: 'error',
+      message: err.message,
+      code: err.code,
+    })
+  }
+  if (err instanceof ZodError) {
+    return res.status(422).json({
+      status: 'error',
+      message: 'Validation failed',
+      errors: err.errors.map(e => ({ field: e.path.join('.'), message: e.message })),
+    })
+  }
+  return res.status(500).json({ status: 'error', message: 'Internal server error' })
+}
+```
+
+---
+
+## Validation — Zod, Always at the Route Edge
+
+```ts
+// validators/worker.validator.ts
+import { z } from 'zod'
+
+export const createProfileSchema = z.object({
+  full_name: z.string().min(2).max(100),
+  dob: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  location_lat: z.number().min(-90).max(90),
+  location_lng: z.number().min(-180).max(180),
+  city: z.string().min(2).max(100),
+  radius_km: z.number().min(1).max(100).default(10),
+  bio: z.string().max(500).optional(),
+  avatar_url: z.string().url().optional(),
+})
+
+export type CreateProfileData = z.infer<typeof createProfileSchema>
+// ^ use this everywhere — no duplicate type definitions
+```
+
+---
+
+## Auth Middleware Pattern
+
+```ts
+// middlewares/auth.middleware.ts
+export async function requireAuth(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '')
+  if (!token) return res.status(401).json({ status: 'error', message: 'Unauthorized' })
+
+  const payload = verifyAccessToken(token)  // throws on invalid
+  req.user = { id: payload.sub, role: payload.role }
+  next()
+}
+
+export function requireRole(role: UserRole) {
+  return (req, res, next) => {
+    if (req.user.role !== role) {
+      return res.status(403).json({ status: 'error', message: 'Forbidden' })
+    }
+    next()
+  }
+}
+
+// Usage in routes:
+router.post('/workers/profile', requireAuth, requireRole('worker'), createProfile)
+```
+
+---
+
+## General Rules
+
+- Every async function must have try/catch or use an `asyncHandler` wrapper
+- Never use `any` — use `unknown` and narrow it
+- Never put `console.log` in production code — use a logger (pino recommended)
+- Every DB query goes through a repository — never write raw DB calls in controllers or services
+- All env vars go in `config/env.ts` with Zod validation on startup
+- Keep functions under 30 lines — if longer, extract a helper
+- Name booleans with `is_` / `has_` / `can_` prefix: `is_verified`, `has_payout`, `can_apply`
+- Dates always stored as UTC, returned as ISO 8601 strings
+- UUIDs generated by DB (`gen_random_uuid()`), not the application layer
